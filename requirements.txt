@@ -10,3 +10,4 @@ transformers
 pysqlite3-binary
 langchain 
 langsmith 
+pypdf
