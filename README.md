@@ -1,0 +1,1 @@
+--- LangSmith Imports ---<br>from langsmith import Client, traceable, tracing_context<br># Note: For LangSmith tracing to work, the following environment variables MUST be set:<br># LANGCHAIN_TRACING_V2 = "true"<br># LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"<br># LANGCHAIN_API_KEY = "your-langsmith-api-key"<br># LANGCHAIN_PROJECT = "your-project-name"<br><br><br>
