@@ -10,32 +10,28 @@ from datetime import datetime
 import re
 import shutil
 
-# --- LangSmith Imports ---
-from langsmith import Client, traceable, tracing_context
-# Note: For LangSmith tracing to work, the following environment variables MUST be set:
-# LANGCHAIN_TRACING_V2 = "true"
-# LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
-# LANGCHAIN_API_KEY = "your-langsmith-api-key"
-# LANGCHAIN_PROJECT = "your-project-name"
-
-
-# This block MUST be at the very top to fix the sqlite3 version issue.
+# --- Dependency Check and Fix for pysqlite3 ---
 try:
+    # This block MUST be at the very top to fix the sqlite3 version issue for ChromaDB
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules['pysqlite3']
 except ImportError:
-    st.error("pysqlite3 is not installed. Please add 'pysqlite3-binary' to your requirements.txt.")
-    st.stop()
+    # If the environment is set up correctly (e.g., in a deployment environment), 
+    # the normal sqlite3 module will be used, but we check for the binary version first.
+    pass
 
-# Now import chromadb and other libraries
+# --- Core RAG Imports ---
 import chromadb
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader # New dependency for PDF handling
+
+# --- LangSmith Imports ---
+from langsmith import Client, traceable, tracing_context
 
 # --- Constants and Configuration ---
 COLLECTION_NAME = "rag_documents"
-# API key is provided by the user
-# NOTE: It's best practice to load API keys from environment variables or Streamlit secrets
+# NOTE: Replace with your actual secrets setup if deploying
 TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "tgp_v1_ecSsk1__FlO2mB_gAaaP2i-Affa6Dv8OCVngkWzBJUY") 
 TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
 
@@ -66,13 +62,17 @@ def initialize_dependencies():
     Using @st.cache_resource ensures this runs only once.
     """
     try:
+        # 1. Initialize ChromaDB (uses a temporary directory since we're not using Firestore)
         db_path = tempfile.mkdtemp()
         db_client = chromadb.PersistentClient(path=db_path)
+        
+        # 2. Initialize Sentence Transformer
         # Explicitly load the model to the CPU to avoid PyTorch-related errors
         model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
+        
         return db_client, model
     except Exception as e:
-        st.error(f"An error occurred during dependency initialization: {e}.")
+        st.error(f"An error occurred during dependency initialization. Check your 'requirements.txt' and environment variables. Error: {e}")
         st.stop()
         
 def get_collection():
@@ -81,14 +81,11 @@ def get_collection():
         name=COLLECTION_NAME
     )
 
-# 1. ADD @traceable for LLM call
 @traceable(run_type="llm")
 def call_together_api(prompt, max_retries=5):
     """
     Calls the Together AI API with exponential backoff for retries.
-    
     The @traceable decorator creates an 'llm' run in LangSmith.
-    The 'prompt' argument serves as the input to the run.
     """
     retry_delay = 1
     for i in range(max_retries):
@@ -97,16 +94,9 @@ def call_together_api(prompt, max_retries=5):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {TOGETHER_API_KEY}"
             }
-            # Together AI expects 'messages' format
             messages_payload = [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
             ]
             payload = {
                 "model": "mistralai/Mistral-7B-Instruct-v0.2",
@@ -118,9 +108,8 @@ def call_together_api(prompt, max_retries=5):
             response = requests.post(TOGETHER_API_URL, headers=headers, data=json.dumps(payload))
             response.raise_for_status()
             
-            # Extract and return the completion content
             response_json = response.json()
-            return response_json['choices'][0]['message']['content'] # LangSmith captures this as the run's output
+            return response_json['choices'][0]['message']['content']
             
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
@@ -141,9 +130,19 @@ def clear_chroma_data():
     """Clears all data from the ChromaDB collection."""
     try:
         if COLLECTION_NAME in [col.name for col in st.session_state.db_client.list_collections()]:
+            # Delete the current collection and create a new empty one
             st.session_state.db_client.delete_collection(name=COLLECTION_NAME)
+            st.session_state.db_client.get_or_create_collection(name=COLLECTION_NAME)
     except Exception as e:
         st.error(f"Error clearing collection: {e}")
+
+def extract_text_from_pdf(uploaded_file):
+    """Extracts text from an uploaded PDF file."""
+    reader = PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
 
 def split_documents(text_data, chunk_size=500, chunk_overlap=100):
     """Splits a single string of text into chunks."""
@@ -154,11 +153,6 @@ def split_documents(text_data, chunk_size=500, chunk_overlap=100):
         is_separator_regex=False,
     )
     return splitter.split_text(text_data)
-
-def is_valid_github_raw_url(url):
-    """Checks if a URL is a valid GitHub raw file URL."""
-    pattern = r"https://raw\.githubusercontent\.com/[\w-]+/[\w-]+/[^/]+/[\w./-]+\.(txt|md)"
-    return re.match(pattern, url) is not None
 
 def process_and_store_documents(documents):
     """
@@ -179,7 +173,6 @@ def process_and_store_documents(documents):
 
     st.toast("Documents processed and stored successfully!", icon="✅")
 
-# 2. ADD @traceable for Retriever call
 @traceable(run_type="retriever")
 def retrieve_documents(query, n_results=5):
     """
@@ -195,9 +188,11 @@ def retrieve_documents(query, n_results=5):
         query_embeddings=query_embedding,
         n_results=n_results
     )
-    return results['documents'][0]
+    # Filter out empty documents array if no results are found
+    if results and results.get('documents') and results['documents'][0]:
+        return results['documents'][0]
+    return []
 
-# 3. ADD @traceable for the entire RAG pipeline (Chain)
 @traceable(run_type="chain")
 def rag_pipeline(query, selected_language_code):
     """
@@ -207,19 +202,31 @@ def rag_pipeline(query, selected_language_code):
     """
     collection = get_collection()
     if collection.count() == 0:
-        return "Hey there! I'm a chatbot that answers questions based on documents you provide. Please upload a `.txt` file or enter a GitHub raw URL in the section above before asking me anything. I'm ready when you are! 😊"
+        return "Hey there! I'm a chatbot that answers questions based on documents you provide. Please upload a `.txt`, `.pdf` file, or enter a GitHub raw URL in the section above before asking me anything. I'm ready when you are! 😊"
 
     # Calls the decorated retrieve_documents function (creates a nested 'retriever' run)
     relevant_docs = retrieve_documents(query)
     
+    if not relevant_docs:
+        # Fallback if the retriever returns nothing (e.g., query is too specific/irrelevant)
+        return "I couldn't find relevant information in the uploaded documents to answer your question."
+
     context = "\n".join(relevant_docs)
-    prompt = f"Using the following information, answer the user's question. The final response MUST be in {st.session_state.selected_language}. If the information is not present, state that you cannot answer. \n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
+    
+    # Ensure the prompt instructs the model to use the retrieved context and output the correct language
+    prompt = (
+        f"You are an expert document assistant. Using ONLY the 'Context' provided below, "
+        f"answer the 'Question'. The final response MUST be in {st.session_state.selected_language}. "
+        f"If the Context does not contain the answer, politely state that the information is missing. "
+        f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
+    )
     
     # Calls the decorated call_together_api function (creates a nested 'llm' run)
     response = call_together_api(prompt)
 
     if response.startswith("Error:"):
-        return "An error occurred while generating the response. Please try again."
+        # The error handling inside call_together_api already provided a message.
+        return response
     
     return response
 
@@ -232,34 +239,71 @@ def display_chat_messages():
 def handle_user_input():
     """Handles new user input, runs the RAG pipeline, and updates chat history."""
     if prompt := st.chat_input("Ask about your document..."):
+        # Update chat history state
         st.session_state.messages.append({"role": "user", "content": prompt})
         
+        # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
             
+        # Run RAG and display assistant message
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
+                # The LangSmith trace starts here for the RAG pipeline
                 response = rag_pipeline(prompt, selected_language_code)
                 st.markdown(response)
 
+        # Update chat history with assistant response
         st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Update the chat title for the sidebar if it's the first message
+        if st.session_state.current_chat_id and st.session_state.chat_history[st.session_state.current_chat_id]['title'] == "New Chat":
+            # Use the first 50 chars of the user's first prompt as the title
+            title = prompt[:50] + ('...' if len(prompt) > 50 else '')
+            st.session_state.chat_history[st.session_state.current_chat_id]['title'] = title
+
 
 # --- Streamlit UI ---
 def main_ui():
     """Sets up the main Streamlit UI for the RAG chatbot."""
-    st.set_page_config(layout="wide")
+    st.set_page_config(
+        page_title="RAG Chat Flow", 
+        layout="wide",
+        initial_sidebar_state="auto"
+    )
+
+    # Initialize dependencies outside of the main UI block to prevent re-initialization
+    if 'db_client' not in st.session_state or 'model' not in st.session_state:
+        st.session_state.db_client, st.session_state.model = initialize_dependencies()
+        
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = {}
+    
+    if 'current_chat_id' not in st.session_state or not st.session_state.messages:
+        # Start a new chat session if none exists or if the current one is empty
+        new_chat_id = str(uuid.uuid4())
+        st.session_state.current_chat_id = new_chat_id
+        st.session_state.messages = []
+        st.session_state.chat_history[new_chat_id] = {
+            'messages': st.session_state.messages,
+            'title': "New Chat",
+            'date': datetime.now()
+        }
 
     # Sidebar
     with st.sidebar:
         st.header("RAG Chat Flow")
         st.session_state.selected_language = st.selectbox(
-            "Select a Language",
+            "Select Response Language",
             options=list(LANGUAGE_DICT.keys()),
             key="language_selector"
         )
         
-        if st.button("New Chat"):
+        if st.button("New Chat", use_container_width=True):
             st.session_state.messages = []
             clear_chroma_data()
             st.session_state.chat_history = {}
@@ -268,6 +312,7 @@ def main_ui():
 
         st.subheader("Chat History")
         if 'chat_history' in st.session_state and st.session_state.chat_history:
+            # Sort chats by date
             sorted_chat_ids = sorted(
                 st.session_state.chat_history.keys(), 
                 key=lambda x: st.session_state.chat_history[x]['date'], 
@@ -276,62 +321,90 @@ def main_ui():
             for chat_id in sorted_chat_ids:
                 chat_title = st.session_state.chat_history[chat_id]['title']
                 date_str = st.session_state.chat_history[chat_id]['date'].strftime("%b %d, %I:%M %p")
-                if st.button(f"**{chat_title}** - {date_str}", key=chat_id):
+                
+                # Highlight the current chat
+                is_current = chat_id == st.session_state.current_chat_id
+                style = "background-color: #262730; border-radius: 5px; padding: 10px;" if is_current else "padding: 10px;"
+                
+                st.markdown(
+                    f"<div style='{style}'>",
+                    unsafe_allow_html=True
+                )
+                if st.button(f"{chat_title}", key=f"btn_{chat_id}", use_container_width=True):
                     st.session_state.current_chat_id = chat_id
                     st.session_state.messages = st.session_state.chat_history[chat_id]['messages']
                     st.experimental_rerun()
+                st.markdown(f"<small>{date_str}</small></div>", unsafe_allow_html=True)
 
     # Main content area
-    st.title("RAG Chat Flow")
-    st.markdown("---")
+    st.title("📚 Retrieval Augmented Generation (RAG) Chatbot")
+    st.info("Upload documents (TXT or PDF) to provide context for the chatbot, and all pipeline steps will be monitored in LangSmith.")
     
-    # Initialize dependencies outside of the main UI block to prevent re-initialization
-    if 'db_client' not in st.session_state or 'model' not in st.session_state:
-        st.session_state.db_client, st.session_state.model = initialize_dependencies()
-
     # Document upload/processing section
     with st.container():
         st.subheader("Add Context Documents")
-        uploaded_files = st.file_uploader("Upload text files (.txt)", type="txt", accept_multiple_files=True)
+        # Combined file uploader for TXT and PDF
+        uploaded_files = st.file_uploader(
+            "Upload files (.txt, .pdf)", 
+            type=["txt", "pdf"], 
+            accept_multiple_files=True
+        )
         github_url = st.text_input("Enter a GitHub raw `.txt` or `.md` URL:")
 
         if uploaded_files:
-            if st.button("Process Files"):
+            if st.button(f"Process {len(uploaded_files)} File(s)"):
                 with st.spinner("Processing files..."):
+                    total_chunks = 0
                     for uploaded_file in uploaded_files:
-                        file_contents = uploaded_file.read().decode("utf-8")
-                        documents = split_documents(file_contents)
-                        process_and_store_documents(documents)
-                    st.success("All files processed and stored successfully! You can now ask questions about their content.")
+                        file_ext = uploaded_file.name.split('.')[-1].lower()
+                        file_contents = None
 
-        if github_url and is_valid_github_raw_url(github_url):
+                        try:
+                            if file_ext == "txt":
+                                file_contents = uploaded_file.read().decode("utf-8")
+                            elif file_ext == "pdf":
+                                # New PDF handling logic
+                                file_contents = extract_text_from_pdf(uploaded_file)
+                            else:
+                                st.warning(f"Skipping unsupported file type: {uploaded_file.name}")
+                                continue
+                            
+                            if file_contents:
+                                documents = split_documents(file_contents)
+                                process_and_store_documents(documents)
+                                total_chunks += len(documents)
+                                
+                        except Exception as e:
+                            st.error(f"Failed to process {uploaded_file.name}: {e}")
+                            continue
+
+                    if total_chunks > 0:
+                        st.success(f"Successfully processed {len(uploaded_files)} file(s) into {total_chunks} chunks!")
+                    else:
+                        st.warning("No new content was added to the knowledge base.")
+
+
+        if github_url:
             if st.button("Process URL"):
-                with st.spinner("Fetching and processing file from URL..."):
-                    try:
-                        response = requests.get(github_url)
-                        response.raise_for_status()
-                        file_contents = response.text
-                        documents = split_documents(file_contents)
-                        process_and_store_documents(documents)
-                        st.success("File from URL processed! You can now chat about its contents.")
-                    except requests.exceptions.RequestException as e:
-                        st.error(f"Error fetching URL: {e}")
-                    except Exception as e:
-                        st.error(f"An unexpected error occurred: {e}")
+                if not is_valid_github_raw_url(github_url):
+                    st.error("Invalid URL format. Please use a raw GitHub URL ending in `.txt` or `.md`.")
+                else:
+                    with st.spinner("Fetching and processing file from URL..."):
+                        try:
+                            response = requests.get(github_url)
+                            response.raise_for_status()
+                            file_contents = response.text
+                            documents = split_documents(file_contents)
+                            process_and_store_documents(documents)
+                            st.success("File from URL processed! You can now chat about its contents.")
+                        except requests.exceptions.RequestException as e:
+                            st.error(f"Error fetching URL: {e}")
+                        except Exception as e:
+                            st.error(f"An unexpected error occurred: {e}")
     
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
+    st.markdown("---")
     
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = {}
-    if 'current_chat_id' not in st.session_state:
-        st.session_state.current_chat_id = str(uuid.uuid4())
-        st.session_state.chat_history[st.session_state.current_chat_id] = {
-            'messages': st.session_state.messages,
-            'title': "New Chat",
-            'date': datetime.now()
-        }
-
+    # Chat display and input
     display_chat_messages()
     handle_user_input()
 
