@@ -1,17 +1,10 @@
 streamlit
-sentence-transformers
-chromadb
 requests
-langchain-text-splitters
-gitpython
-numpy
-torch
-transformers
-pysqlite3-binary
-langchain
-langsmith
 pypdf
-pydantic
+chromadb
+sentence-transformers
 langchain-ollama
-langchain-community
-langchain-core  
+langchain-core
+pydantic
+# Optional (for tracing)
+langsmith
