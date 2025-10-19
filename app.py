@@ -11,7 +11,6 @@ import re
 import shutil
 
 # --- Dependency Check and Fix for pysqlite3 ---
-# This block MUST be at the very top to fix the sqlite3 version issue for ChromaDB
 try:
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules['pysqlite3']
@@ -37,13 +36,13 @@ from langsmith import Client, traceable, tracing_context
 COLLECTION_NAME = "rag_documents"
 
 # --- Ollama/Local LLM Configuration ---
-OLLAMA_MODEL = "mistral" # Ensure you have pulled this model with 'ollama pull mistral'
-# IMPORTANT FIX NOTE:
-# The 'Cannot assign requested address' error is because this address
-# is inaccessible from Streamlit Cloud. If you deploy to the cloud,
-# you MUST change this to the public IP/hostname of your running Ollama server.
-OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "mistral" 
 LLM_TIMEOUT = 120 # Timeout for the LLM call
+
+# 💥 CRITICAL FIX FOR [Errno 99] on STREAMLIT CLOUD 💥
+# YOU MUST CHANGE THIS TO THE PUBLIC IP OR HOSTNAME OF YOUR OLLAMA SERVER!
+# 'localhost' only works if Streamlit and Ollama are on the same machine.
+OLLAMA_URL = "http://YOUR_PUBLIC_OLLAMA_HOST_IP:11434" 
 
 # Dictionary of supported languages and their ISO 639-1 codes for the LLM
 LANGUAGE_DICT = {
@@ -77,7 +76,6 @@ def initialize_dependencies():
         db_client = chromadb.PersistentClient(path=db_path)
 
         # 2. Initialize Sentence Transformer
-        # Ensure the device is 'cpu' for Streamlit Cloud compatibility unless you configure GPUs
         model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
 
         # 3. Initialize Ollama Chat Model
@@ -118,12 +116,13 @@ def call_local_llm(prompt, max_retries=5):
             return response.content
 
         except requests.exceptions.ConnectionError as e:
-            # Catch the specific connection error for better user feedback
             st.warning(f"Connection error to Ollama at {OLLAMA_URL}. Ensure Ollama is running, the model '{OLLAMA_MODEL}' is pulled, and the URL is accessible from this environment. Retrying in 2 seconds...")
-            # Added for debugging the specific Errno 99
+            
+            # This handles the specific error from your traceback
             if "Cannot assign requested address" in str(e):
-                 st.error("Connection failed: [Errno 99] Cannot assign requested address. If you're on Streamlit Cloud, you must change 'localhost' to a public IP/hostname where Ollama is hosted.")
-                 break # Do not retry on a configuration error
+                 st.error(f"Connection failed: [Errno 99] Cannot assign requested address. You are likely on Streamlit Cloud trying to connect to 'localhost'. **You must change OLLAMA_URL to a public IP/hostname**.")
+                 return "Error: Cannot assign requested address. Check your OLLAMA_URL configuration." # Stop retrying on a config error
+            
             time.sleep(2)
         except ValidationError as e:
             st.error(f"Pydantic Validation Error (often means malformed response or connection issue): {e}")
@@ -140,7 +139,6 @@ def clear_chroma_data():
     """Clears all data from the ChromaDB collection."""
     try:
         if COLLECTION_NAME in [col.name for col in st.session_state.db_client.list_collections()]:
-            # Delete the current collection and create a new empty one
             st.session_state.db_client.delete_collection(name=COLLECTION_NAME)
             st.session_state.db_client.get_or_create_collection(name=COLLECTION_NAME)
     except Exception as e:
@@ -198,37 +196,26 @@ def retrieve_documents(query, n_results=5):
         query_embeddings=query_embedding,
         n_results=n_results
     )
-    # Filter out empty documents array if no results are found
     if results and results.get('documents') and results['documents'][0]:
         return results['documents'][0]
     return []
-
-def is_valid_github_raw_url(url):
-    """Simple check for a GitHub raw file URL for .txt or .md."""
-    pattern = re.compile(r"^https://raw\.githubusercontent\.com/.*?\.(txt|md)$", re.IGNORECASE)
-    return bool(pattern.match(url))
 
 @traceable(run_type="chain")
 def rag_pipeline(query, selected_language_code):
     """
     Executes the full RAG pipeline with a check for documents.
-    The @traceable decorator creates a 'chain' run in LangSmith, which
-    will nest the 'retriever' and 'llm' calls.
     """
     collection = get_collection()
     if collection.count() == 0:
         return "Hey there! I'm a chatbot that answers questions based on documents you provide. Please upload a `.txt`, `.pdf` file, or enter a GitHub raw URL in the section above before asking me anything. I'm ready when you are! 😊"
 
-    # Calls the decorated retrieve_documents function (creates a nested 'retriever' run)
     relevant_docs = retrieve_documents(query)
 
     if not relevant_docs:
-        # Fallback if the retriever returns nothing
         return "I couldn't find relevant information in the uploaded documents to answer your question."
 
     context = "\n".join(relevant_docs)
 
-    # Ensure the prompt instructs the model to use the retrieved context and output the correct language
     prompt = (
         f"You are an expert document assistant. Using ONLY the 'Context' provided below, "
         f"answer the 'Question'. The final response MUST be in {st.session_state.selected_language}. "
@@ -236,7 +223,6 @@ def rag_pipeline(query, selected_language_code):
         f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
     )
 
-    # Calls the decorated call_local_llm function (creates a nested 'llm' run)
     response = call_local_llm(prompt)
 
     if response.startswith("Error:"):
@@ -253,27 +239,20 @@ def display_chat_messages():
 def handle_user_input():
     """Handles new user input, runs the RAG pipeline, and updates chat history."""
     if prompt := st.chat_input("Ask about your document..."):
-        # Update chat history state
         st.session_state.messages.append({"role": "user", "content": prompt})
 
-        # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Run RAG and display assistant message
         with st.chat_message("assistant"):
-            # This line caused the KeyError: 0 because st.session_state.selected_language was uninitialized
+            # This line now safely uses the initialized session state value
             selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
-            # The LangSmith trace starts here for the RAG pipeline
             response = rag_pipeline(prompt, selected_language_code)
             st.markdown(response)
 
-        # Update chat history with assistant response
         st.session_state.messages.append({"role": "assistant", "content": response})
 
-        # Update the chat title for the sidebar if it's the first message
         if st.session_state.current_chat_id and st.session_state.chat_history[st.session_state.current_chat_id]['title'] == "New Chat":
-            # Use the first 50 chars of the user's first prompt as the title
             title = prompt[:50] + ('...' if len(prompt) > 50 else '')
             st.session_state.chat_history[st.session_state.current_chat_id]['title'] = title
 
@@ -287,22 +266,22 @@ def main_ui():
         initial_sidebar_state="auto"
     )
 
-    # Initialize dependencies: db_client, model, and the new ollama_client
+    # Initialize dependencies
     if 'db_client' not in st.session_state or 'model' not in st.session_state or 'ollama_client' not in st.session_state:
         st.session_state.db_client, st.session_state.model, st.session_state.ollama_client = initialize_dependencies()
 
+    # Initialize ALL session state variables with valid defaults
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = {}
         
-    # 💥 CRITICAL FIX: Initialize selected_language to a valid key before use
+    # FIXED: Initialize selected_language to prevent KeyError: 0
     if 'selected_language' not in st.session_state:
         st.session_state.selected_language = "English"
 
-
-    # Only start a new chat if one isn't currently active (e.g., after initial load or "New Chat" button click)
+    # Start a new chat if necessary
     if 'current_chat_id' not in st.session_state or not st.session_state.messages:
         new_chat_id = str(uuid.uuid4())
         st.session_state.current_chat_id = new_chat_id
@@ -316,30 +295,27 @@ def main_ui():
     # Sidebar
     with st.sidebar:
         st.header("RAG Chat Flow")
-        # IMPORTANT NOTE on OLLAMA_URL
+        # Display the critical warning about the URL
         st.markdown(f"Running LLM: **{OLLAMA_MODEL}** via Ollama at **{OLLAMA_URL}**")
-        st.warning("⚠️ If you are deploying to Streamlit Cloud, the URL above **MUST be changed** to a publicly accessible IP/hostname for your Ollama server.")
+        st.error("❌ CRITICAL: If you are deployed on Streamlit Cloud and see **[Errno 99]**, you **MUST** change `OLLAMA_URL` in `app.py` to a **public IP/hostname** (not `localhost`) where your Ollama server is running.")
 
-        # The st.selectbox will now safely use the initialized value from session state
+        # Selectbox uses the safely initialized value
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
             options=list(LANGUAGE_DICT.keys()),
             key="language_selector",
-            # Ensure the selected option is correct on reruns
             index=list(LANGUAGE_DICT.keys()).index(st.session_state.selected_language)
         )
 
         if st.button("New Chat / Clear Documents", use_container_width=True):
             st.session_state.messages = []
-            clear_chroma_data() # Clear all documents on new chat
-            # Reset chat history logic for a clean start
+            clear_chroma_data() 
             st.session_state.chat_history = {}
             st.session_state.current_chat_id = None
             st.experimental_rerun()
 
         st.subheader("Chat History")
         if 'chat_history' in st.session_state and st.session_state.chat_history:
-            # Sort chats by date
             sorted_chat_ids = sorted(
                 st.session_state.chat_history.keys(),
                 key=lambda x: st.session_state.chat_history[x]['date'],
@@ -350,15 +326,10 @@ def main_ui():
                 date_str = st.session_state.chat_history[chat_id]['date'].strftime("%b %d, %I:%M %p")
 
                 is_current = chat_id == st.session_state.current_chat_id
-                # Conditional styling for the current chat
                 style = "background-color: #262730; border-radius: 5px; padding: 10px;" if is_current else "padding: 10px;"
 
                 with st.container():
-                    st.markdown(
-                        f"<div style='{style}'>",
-                        unsafe_allow_html=True
-                    )
-                    # Use a unique key for each button and set the current chat on click
+                    st.markdown(f"<div style='{style}'>", unsafe_allow_html=True)
                     if st.button(f"{chat_title}", key=f"btn_{chat_id}", use_container_width=True):
                         st.session_state.current_chat_id = chat_id
                         st.session_state.messages = st.session_state.chat_history[chat_id]['messages']
@@ -367,12 +338,11 @@ def main_ui():
 
     # Main content area
     st.title("📚 Retrieval Augmented Generation (RAG) Chatbot - Local LLM")
-    st.info("Upload documents (TXT or PDF) to provide context. Powered by Ollama/Mistral and traceable in LangSmith.")
+    st.info("Upload documents (TXT or PDF) to provide context. Powered by Ollama/Mistral.")
 
     # Document upload/processing section
     with st.container():
         st.subheader("Add Context Documents")
-        # Combined file uploader for TXT and PDF
         uploaded_files = st.file_uploader(
             "Upload files (.txt, .pdf)",
             type=["txt", "pdf"],
