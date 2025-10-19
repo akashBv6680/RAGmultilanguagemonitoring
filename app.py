@@ -26,7 +26,7 @@ from pypdf import PdfReader
 
 # --- Local LLM & LangChain Imports ---
 from langchain_ollama import ChatOllama
-# FIX: Changed import path from langchain.schema to langchain_core.messages
+# FIXED: Import location for message schemas moved to langchain_core.messages
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
@@ -262,6 +262,7 @@ def handle_user_input():
 
         # Run RAG and display assistant message
         with st.chat_message("assistant"):
+            # This line caused the KeyError: 0 because st.session_state.selected_language was uninitialized
             selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
             # The LangSmith trace starts here for the RAG pipeline
             response = rag_pipeline(prompt, selected_language_code)
@@ -295,6 +296,11 @@ def main_ui():
 
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = {}
+        
+    # 💥 CRITICAL FIX: Initialize selected_language to a valid key before use
+    if 'selected_language' not in st.session_state:
+        st.session_state.selected_language = "English"
+
 
     # Only start a new chat if one isn't currently active (e.g., after initial load or "New Chat" button click)
     if 'current_chat_id' not in st.session_state or not st.session_state.messages:
@@ -314,10 +320,13 @@ def main_ui():
         st.markdown(f"Running LLM: **{OLLAMA_MODEL}** via Ollama at **{OLLAMA_URL}**")
         st.warning("⚠️ If you are deploying to Streamlit Cloud, the URL above **MUST be changed** to a publicly accessible IP/hostname for your Ollama server.")
 
+        # The st.selectbox will now safely use the initialized value from session state
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
             options=list(LANGUAGE_DICT.keys()),
-            key="language_selector"
+            key="language_selector",
+            # Ensure the selected option is correct on reruns
+            index=list(LANGUAGE_DICT.keys()).index(st.session_state.selected_language)
         )
 
         if st.button("New Chat / Clear Documents", use_container_width=True):
