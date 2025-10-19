@@ -8,6 +8,7 @@ numpy==1.26.4
 torch
 transformers
 pysqlite3-binary
-langchain 
-langsmith 
+langchain
+langsmith
 pypdf
+pydantic
