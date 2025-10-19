@@ -25,9 +25,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 # --- Local LLM & LangChain Imports ---
-# FIX: Changed import location for ChatOllama
-from langchain_ollama import ChatOllama 
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+# FIX: Changed import path from langchain.schema to langchain_core.messages
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 # --- LangSmith Imports ---
@@ -38,11 +38,11 @@ COLLECTION_NAME = "rag_documents"
 
 # --- Ollama/Local LLM Configuration ---
 OLLAMA_MODEL = "mistral" # Ensure you have pulled this model with 'ollama pull mistral'
-# IMPORTANT FIX NOTE: 
-# The 'Cannot assign requested address' error is because this address 
-# is inaccessible from Streamlit Cloud. If you deploy to the cloud, 
+# IMPORTANT FIX NOTE:
+# The 'Cannot assign requested address' error is because this address
+# is inaccessible from Streamlit Cloud. If you deploy to the cloud,
 # you MUST change this to the public IP/hostname of your running Ollama server.
-OLLAMA_URL = "http://localhost:11434" 
+OLLAMA_URL = "http://localhost:11434"
 LLM_TIMEOUT = 120 # Timeout for the LLM call
 
 # Dictionary of supported languages and their ISO 639-1 codes for the LLM
@@ -75,11 +75,11 @@ def initialize_dependencies():
         # 1. Initialize ChromaDB
         db_path = tempfile.mkdtemp()
         db_client = chromadb.PersistentClient(path=db_path)
-        
+
         # 2. Initialize Sentence Transformer
         # Ensure the device is 'cpu' for Streamlit Cloud compatibility unless you configure GPUs
-        model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu') 
-        
+        model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
+
         # 3. Initialize Ollama Chat Model
         ollama_client = ChatOllama(
             base_url=OLLAMA_URL,
@@ -87,12 +87,12 @@ def initialize_dependencies():
             temperature=0.7,
             request_timeout=LLM_TIMEOUT,
         )
-        
+
         return db_client, model, ollama_client
     except Exception as e:
         st.error(f"An error occurred during dependency initialization. Please check your **Ollama server (must be accessible)**, **OLLAMA_MODEL** name, and **OLLAMA_URL**. Error: {e}")
         st.stop()
-        
+
 def get_collection():
     """Retrieves or creates the ChromaDB collection."""
     return st.session_state.db_client.get_or_create_collection(
@@ -106,17 +106,17 @@ def call_local_llm(prompt, max_retries=5):
     The @traceable decorator creates an 'llm' run in LangSmith.
     """
     ollama_client = st.session_state.ollama_client
-    
+
     system_message = SystemMessage(content="You are a helpful assistant. Be concise and accurate.")
     user_message = HumanMessage(content=prompt)
-    
+
     # Simple retry mechanism for local service/network issues
     for i in range(max_retries):
         try:
             with st.spinner(f"Contacting {OLLAMA_MODEL} on {OLLAMA_URL}... (Attempt {i+1}/{max_retries})"):
                 response = ollama_client.invoke([system_message, user_message])
             return response.content
-            
+
         except requests.exceptions.ConnectionError as e:
             # Catch the specific connection error for better user feedback
             st.warning(f"Connection error to Ollama at {OLLAMA_URL}. Ensure Ollama is running, the model '{OLLAMA_MODEL}' is pulled, and the URL is accessible from this environment. Retrying in 2 seconds...")
@@ -174,7 +174,7 @@ def process_and_store_documents(documents):
 
     embeddings = model.encode(documents).tolist()
     document_ids = [str(uuid.uuid4()) for _ in documents]
-    
+
     collection.add(
         documents=documents,
         embeddings=embeddings,
@@ -191,9 +191,9 @@ def retrieve_documents(query, n_results=5):
     """
     collection = get_collection()
     model = st.session_state.model
-    
+
     query_embedding = model.encode(query).tolist()
-    
+
     results = collection.query(
         query_embeddings=query_embedding,
         n_results=n_results
@@ -221,13 +221,13 @@ def rag_pipeline(query, selected_language_code):
 
     # Calls the decorated retrieve_documents function (creates a nested 'retriever' run)
     relevant_docs = retrieve_documents(query)
-    
+
     if not relevant_docs:
         # Fallback if the retriever returns nothing
         return "I couldn't find relevant information in the uploaded documents to answer your question."
 
     context = "\n".join(relevant_docs)
-    
+
     # Ensure the prompt instructs the model to use the retrieved context and output the correct language
     prompt = (
         f"You are an expert document assistant. Using ONLY the 'Context' provided below, "
@@ -235,13 +235,13 @@ def rag_pipeline(query, selected_language_code):
         f"If the Context does not contain the answer, politely state that the information is missing. "
         f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
     )
-    
+
     # Calls the decorated call_local_llm function (creates a nested 'llm' run)
     response = call_local_llm(prompt)
 
     if response.startswith("Error:"):
         return response
-    
+
     return response
 
 def display_chat_messages():
@@ -255,11 +255,11 @@ def handle_user_input():
     if prompt := st.chat_input("Ask about your document..."):
         # Update chat history state
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
+
         # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
-            
+
         # Run RAG and display assistant message
         with st.chat_message("assistant"):
             selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
@@ -269,7 +269,7 @@ def handle_user_input():
 
         # Update chat history with assistant response
         st.session_state.messages.append({"role": "assistant", "content": response})
-        
+
         # Update the chat title for the sidebar if it's the first message
         if st.session_state.current_chat_id and st.session_state.chat_history[st.session_state.current_chat_id]['title'] == "New Chat":
             # Use the first 50 chars of the user's first prompt as the title
@@ -281,7 +281,7 @@ def handle_user_input():
 def main_ui():
     """Sets up the main Streamlit UI for the RAG chatbot."""
     st.set_page_config(
-        page_title="RAG Chat Flow (Ollama)", 
+        page_title="RAG Chat Flow (Ollama)",
         layout="wide",
         initial_sidebar_state="auto"
     )
@@ -289,13 +289,13 @@ def main_ui():
     # Initialize dependencies: db_client, model, and the new ollama_client
     if 'db_client' not in st.session_state or 'model' not in st.session_state or 'ollama_client' not in st.session_state:
         st.session_state.db_client, st.session_state.model, st.session_state.ollama_client = initialize_dependencies()
-        
+
     if 'messages' not in st.session_state:
         st.session_state.messages = []
-    
+
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = {}
-    
+
     # Only start a new chat if one isn't currently active (e.g., after initial load or "New Chat" button click)
     if 'current_chat_id' not in st.session_state or not st.session_state.messages:
         new_chat_id = str(uuid.uuid4())
@@ -319,7 +319,7 @@ def main_ui():
             options=list(LANGUAGE_DICT.keys()),
             key="language_selector"
         )
-        
+
         if st.button("New Chat / Clear Documents", use_container_width=True):
             st.session_state.messages = []
             clear_chroma_data() # Clear all documents on new chat
@@ -332,18 +332,18 @@ def main_ui():
         if 'chat_history' in st.session_state and st.session_state.chat_history:
             # Sort chats by date
             sorted_chat_ids = sorted(
-                st.session_state.chat_history.keys(), 
-                key=lambda x: st.session_state.chat_history[x]['date'], 
+                st.session_state.chat_history.keys(),
+                key=lambda x: st.session_state.chat_history[x]['date'],
                 reverse=True
             )
             for chat_id in sorted_chat_ids:
                 chat_title = st.session_state.chat_history[chat_id]['title']
                 date_str = st.session_state.chat_history[chat_id]['date'].strftime("%b %d, %I:%M %p")
-                
+
                 is_current = chat_id == st.session_state.current_chat_id
                 # Conditional styling for the current chat
                 style = "background-color: #262730; border-radius: 5px; padding: 10px;" if is_current else "padding: 10px;"
-                
+
                 with st.container():
                     st.markdown(
                         f"<div style='{style}'>",
@@ -359,14 +359,14 @@ def main_ui():
     # Main content area
     st.title("📚 Retrieval Augmented Generation (RAG) Chatbot - Local LLM")
     st.info("Upload documents (TXT or PDF) to provide context. Powered by Ollama/Mistral and traceable in LangSmith.")
-    
+
     # Document upload/processing section
     with st.container():
         st.subheader("Add Context Documents")
         # Combined file uploader for TXT and PDF
         uploaded_files = st.file_uploader(
-            "Upload files (.txt, .pdf)", 
-            type=["txt", "pdf"], 
+            "Upload files (.txt, .pdf)",
+            type=["txt", "pdf"],
             accept_multiple_files=True
         )
         github_url = st.text_input("Enter a GitHub raw `.txt` or `.md` URL (e.g., https://raw.githubusercontent.com/user/repo/branch/file.txt):")
@@ -387,12 +387,12 @@ def main_ui():
                             else:
                                 st.warning(f"Skipping unsupported file type: {uploaded_file.name}")
                                 continue
-                            
+
                             if file_contents:
                                 documents = split_documents(file_contents)
                                 process_and_store_documents(documents)
                                 total_chunks += len(documents)
-                                
+
                         except Exception as e:
                             st.error(f"Failed to process {uploaded_file.name}: {e}")
                             continue
@@ -420,9 +420,9 @@ def main_ui():
                             st.error(f"Error fetching URL: {e}")
                         except Exception as e:
                             st.error(f"An unexpected error occurred: {e}")
-    
+
     st.markdown("---")
-    
+
     # Chat display and input
     display_chat_messages()
     handle_user_input()
