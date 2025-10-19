@@ -12,3 +12,4 @@ langchain
 langsmith
 pypdf
 pydantic
+langchain-ollama
