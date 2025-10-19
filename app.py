@@ -3,7 +3,6 @@ import os
 import sys
 import tempfile
 import uuid
-import json
 import requests
 import time
 from datetime import datetime
@@ -12,8 +11,6 @@ import shutil
 
 # =====================================================================
 # FIX 1: SQLITE3 PATCH
-# This block MUST be at the very top to fix the sqlite3 version issue 
-# for libraries like ChromaDB on Streamlit Community Cloud.
 # =====================================================================
 try:
     __import__('pysqlite3')
@@ -27,8 +24,9 @@ from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
-# --- Hugging Face Imports ---
-from huggingface_hub import InferenceClient
+# --- Google Gemini Imports ---
+from google import genai
+from google.genai.errors import APIError
 
 # --- LangSmith Imports ---
 from langsmith import traceable, tracing_context
@@ -36,53 +34,41 @@ from langsmith import traceable, tracing_context
 # --- Constants and Configuration ---
 COLLECTION_NAME = "rag_documents"
 
-# *** CRITICAL FIX: Switched to the low-parameter, fast Gemma 2B Instruct model ***
-HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY") 
-HF_MODEL_ID = "google/gemma-2b-it" 
+# *** CRITICAL FIX: Read API Key from Streamlit Secrets ***
+# This is the line that reads the key from the .streamlit/secrets.toml file
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
+GEMINI_MODEL_ID = "gemini-2.5-flash-preview-09-2025" 
 
-if not HUGGINGFACE_API_KEY:
-    st.error("HUGGINGFACE_API_KEY environment variable is not set. Please set it in your Streamlit secrets or environment.")
-    # st.stop() 
-
+if not GEMINI_API_KEY:
+    # Use st.warning to show the message on the Streamlit page
+    st.warning("🚨 GEMINI_API_KEY is not set in Streamlit Secrets. Please set it to proceed.")
+    st.stop() 
+    
 # Dictionary of supported languages and their ISO 639-1 codes for the LLM
 LANGUAGE_DICT = {
-    "English": "en",
-    "Spanish": "es",
-    "Arabic": "ar",
-    "French": "fr",
-    "German": "de",
-    "Hindi": "hi",
-    "Tamil": "ta",
-    "Bengali": "bn",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "Russian": "ru",
-    "Chinese (Simplified)": "zh-Hans",
-    "Portuguese": "pt",
-    "Italian": "it",
-    "Dutch": "nl",
-    "Turkish": "tr"
+    # ... (rest of the dictionary is unchanged)
+    "English": "en", "Spanish": "es", "Arabic": "ar", "French": "fr", 
+    "German": "de", "Hindi": "hi", "Tamil": "ta", "Bengali": "bn", 
+    "Japanese": "ja", "Korean": "ko", "Russian": "ru", 
+    "Chinese (Simplified)": "zh-Hans", "Portuguese": "pt", 
+    "Italian": "it", "Dutch": "nl", "Turkish": "tr"
 }
 
 # =====================================================================
 # SESSION STATE INITIALIZATION
 # =====================================================================
-if 'selected_language' not in st.session_state:
-    st.session_state['selected_language'] = 'English'
-    
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = {}
-if 'current_chat_id' not in st.session_state:
-    st.session_state.current_chat_id = None
+# ... (rest of the session state initialization is unchanged)
+if 'selected_language' not in st.session_state: st.session_state['selected_language'] = 'English'
+if 'messages' not in st.session_state: st.session_state.messages = []
+if 'chat_history' not in st.session_state: st.session_state.chat_history = {}
+if 'current_chat_id' not in st.session_state: st.session_state.current_chat_id = None
 
 
 @st.cache_resource
 def initialize_dependencies():
     """
     Initializes and returns the ChromaDB client, SentenceTransformer model,
-    and the Hugging Face Inference Client.
+    and the Google GenAI Client.
     """
     try:
         # 1. Initialize ChromaDB
@@ -92,14 +78,11 @@ def initialize_dependencies():
         # 2. Initialize Sentence Transformer (for embeddings)
         model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
         
-        # 3. Initialize Hugging Face Inference Client (for LLM)
-        # Note: Gemma models on Hugging Face require accepting a license on the Hub page
-        hf_client = InferenceClient(
-            model=HF_MODEL_ID, 
-            token=HUGGINGFACE_API_KEY
-        )
+        # 3. Initialize Google GenAI Client (for LLM)
+        # The key is now passed directly to the client from the st.secrets variable
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         
-        return db_client, model, hf_client
+        return db_client, model, gemini_client
     except Exception as e:
         st.error(f"An error occurred during dependency initialization. Error: {e}")
         st.stop()
@@ -111,57 +94,41 @@ def get_collection():
     )
 
 @traceable(run_type="llm")
-def call_huggingface_api(prompt, max_retries=5):
+def call_gemini_api(prompt, max_retries=3):
     """
-    Calls the Hugging Face Inference API for text generation.
-    Uses a simple retry mechanism for common loading/rate limit errors.
+    Calls the Google Gemini API for text generation.
     """
-    hf_client = st.session_state.hf_client
-    
-    # Use the Gemma Instruct template for best performance:
-    # <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
-    full_prompt = f"<bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+    gemini_client = st.session_state.gemini_client
     
     retry_delay = 1
     for i in range(max_retries):
         try:
-            # Use the dedicated text_generation method
-            response = hf_client.text_generation(
-                prompt=full_prompt,
-                max_new_tokens=1024,
-                temperature=0.7,
-                # Setting this can help avoid a specific class of errors 
-                # for certain gated models, even if Gemma is open.
-                do_sample=True,
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL_ID,
+                contents=prompt,
+                config=genai.types.GenerateContentConfig(
+                    temperature=0.7,
+                    max_output_tokens=1024,
+                )
             )
+            return response.text.strip()
             
-            return response.strip()
-            
-        except requests.exceptions.HTTPError as e:
-            # Handle common Hugging Face Inference API errors
-            status_code = e.response.status_code
-            if status_code in [429, 503]:
-                st.warning(f"Model is loading or rate limit exceeded (Code: {status_code}). Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            elif status_code == 401:
-                st.error("Invalid Hugging Face API Key. Please check your HUGGINGFACE_API_KEY.")
-                return f"Error: 401 Unauthorized"
-            elif status_code == 400:
-                 st.error(f"400 Bad Request. Ensure you have accepted the license for the model '{HF_MODEL_ID}' on the Hugging Face Hub.")
-                 return f"Error: 400 Bad Request / License not accepted"
-            else:
-                st.error(f"Failed to call API after {i+1} retries. Status: {status_code}. Error: {e}")
-                return f"Error: {e}"
+        except APIError as e:
+            st.warning(f"Gemini API error (try {i+1}/{max_retries}). Retrying in {retry_delay} seconds. Error: {e}")
+            time.sleep(retry_delay)
+            retry_delay *= 2
         except Exception as e:
             st.error(f"An unexpected error occurred during the API call: {e}")
             return f"Error: {e}"
+    
+    return "Error: Failed to get a response from the model after multiple retries."
+
 
 def clear_chroma_data():
+# ... (all document and document processing functions are unchanged)
     """Clears all data from the ChromaDB collection."""
     try:
         if COLLECTION_NAME in [col.name for col in st.session_state.db_client.list_collections()]:
-            # Delete the current collection and create a new empty one
             st.session_state.db_client.delete_collection(name=COLLECTION_NAME)
             st.session_state.db_client.get_or_create_collection(name=COLLECTION_NAME)
     except Exception as e:
@@ -218,7 +185,6 @@ def retrieve_documents(query, n_results=5):
         query_embeddings=query_embedding,
         n_results=n_results
     )
-    # Filter out empty documents array if no results are found
     if results and results.get('documents') and results['documents'][0]:
         return results['documents'][0]
     return []
@@ -232,16 +198,13 @@ def rag_pipeline(query, selected_language_code):
     if collection.count() == 0:
         return "Hey there! I'm a chatbot that answers questions based on documents you provide. Please upload a `.txt`, `.pdf` file, or enter a GitHub raw URL in the section above before asking me anything. I'm ready when you are! 😊"
 
-    # Calls the decorated retrieve_documents function (creates a nested 'retriever' run)
     relevant_docs = retrieve_documents(query)
     
     if not relevant_docs:
-        # Fallback if the retriever returns nothing (e.g., query is too specific/irrelevant)
         return "I couldn't find relevant information in the uploaded documents to answer your question."
 
     context = "\n".join(relevant_docs)
     
-    # Prompt engineering for a small model to focus ONLY on context and output the correct language
     prompt = (
         f"You are an expert document assistant. Your task is to answer the 'Question' using ONLY the 'Context' provided below. "
         f"Your final response MUST be in {st.session_state.selected_language}. "
@@ -249,8 +212,7 @@ def rag_pipeline(query, selected_language_code):
         f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
     )
     
-    # Calls the decorated call_huggingface_api function 
-    response = call_huggingface_api(prompt)
+    response = call_gemini_api(prompt)
 
     if response.startswith("Error:"):
         return response
@@ -258,6 +220,7 @@ def rag_pipeline(query, selected_language_code):
     return response
 
 def display_chat_messages():
+# ... (all UI helper functions are unchanged)
     """Displays all chat messages in the Streamlit app."""
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -270,26 +233,20 @@ def is_valid_github_raw_url(url):
 def handle_user_input():
     """Handles new user input, runs the RAG pipeline, and updates chat history."""
     if prompt := st.chat_input("Ask about your document..."):
-        # Update chat history state
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
             
-        # Run RAG and display assistant message
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 selected_language_code = LANGUAGE_DICT[st.session_state.selected_language] 
                 response = rag_pipeline(prompt, selected_language_code)
                 st.markdown(response)
 
-        # Update chat history with assistant response
         st.session_state.messages.append({"role": "assistant", "content": response})
         
-        # Update the chat title for the sidebar if it's the first message
         if st.session_state.current_chat_id and st.session_state.chat_history[st.session_state.current_chat_id]['title'] == "New Chat":
-            # Use the first 50 chars of the user's first prompt as the title
             title = prompt[:50] + ('...' if len(prompt) > 50 else '')
             st.session_state.chat_history[st.session_state.current_chat_id]['title'] = title
 
@@ -298,17 +255,16 @@ def handle_user_input():
 def main_ui():
     """Sets up the main Streamlit UI for the RAG chatbot."""
     st.set_page_config(
-        page_title="RAG Chat Flow (Hugging Face LLM)", 
+        page_title="RAG Chat Flow (Gemini LLM)", 
         layout="wide",
         initial_sidebar_state="auto"
     )
 
-    # Initialize dependencies: db_client, model, and hf_client
-    if 'db_client' not in st.session_state or 'model' not in st.session_state or 'hf_client' not in st.session_state:
-        st.session_state.db_client, st.session_state.model, st.session_state.hf_client = initialize_dependencies()
+    # Initialize dependencies: db_client, model, and gemini_client
+    if 'db_client' not in st.session_state or 'model' not in st.session_state or 'gemini_client' not in st.session_state:
+        st.session_state.db_client, st.session_state.model, st.session_state.gemini_client = initialize_dependencies()
         
     if 'current_chat_id' not in st.session_state or not st.session_state.messages:
-        # Start a new chat session if none exists or if the current one is empty
         new_chat_id = str(uuid.uuid4())
         st.session_state.current_chat_id = new_chat_id
         st.session_state.messages = []
@@ -322,8 +278,7 @@ def main_ui():
     with st.sidebar:
         st.header("RAG Chat Flow")
         
-        # Display the current LLM
-        st.caption(f"LLM: **{HF_MODEL_ID}**")
+        st.caption(f"LLM: **{GEMINI_MODEL_ID}**")
         
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
@@ -340,7 +295,6 @@ def main_ui():
 
         st.subheader("Chat History")
         if 'chat_history' in st.session_state and st.session_state.chat_history:
-            # Sort chats by date
             sorted_chat_ids = sorted(
                 st.session_state.chat_history.keys(), 
                 key=lambda x: st.session_state.chat_history[x]['date'], 
@@ -350,7 +304,6 @@ def main_ui():
                 chat_title = st.session_state.chat_history[chat_id]['title']
                 date_str = st.session_state.chat_history[chat_id]['date'].strftime("%b %d, %I:%M %p")
                 
-                # Highlight the current chat
                 is_current = chat_id == st.session_state.current_chat_id
                 style = "background-color: #262730; border-radius: 5px; padding: 10px;" if is_current else "padding: 10px;"
                 
@@ -366,12 +319,11 @@ def main_ui():
 
     # Main content area
     st.title("📚 Retrieval Augmented Generation (RAG) Chatbot")
-    st.info("Powered by Hugging Face Inference API and monitored via LangSmith.")
+    st.info("Powered by Google Gemini API and monitored via LangSmith.")
     
     # Document upload/processing section
     with st.container():
         st.subheader("Add Context Documents")
-        # Combined file uploader for TXT and PDF
         uploaded_files = st.file_uploader(
             "Upload files (.txt, .pdf)", 
             type=["txt", "pdf"], 
@@ -391,7 +343,6 @@ def main_ui():
                             if file_ext == "txt":
                                 file_contents = uploaded_file.read().decode("utf-8")
                             elif file_ext == "pdf":
-                                # New PDF handling logic
                                 file_contents = extract_text_from_pdf(uploaded_file)
                             else:
                                 st.warning(f"Skipping unsupported file type: {uploaded_file.name}")
