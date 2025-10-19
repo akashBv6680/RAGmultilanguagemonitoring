@@ -16,24 +16,30 @@ try:
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules['pysqlite3']
 except ImportError:
-    # If the environment is set up correctly (e.g., in a deployment environment), 
-    # the normal sqlite3 module will be used, but we check for the binary version first.
+    # If the environment is set up correctly, the normal sqlite3 module will be used.
     pass
 
 # --- Core RAG Imports ---
 import chromadb
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader # New dependency for PDF handling
+from pypdf import PdfReader
+
+# --- Local LLM & LangChain Imports ---
+from langchain.chat_models import ChatOllama
+from langchain.schema import HumanMessage, SystemMessage
+from pydantic import ValidationError # Added for better error handling with LangChain
 
 # --- LangSmith Imports ---
 from langsmith import Client, traceable, tracing_context
 
 # --- Constants and Configuration ---
 COLLECTION_NAME = "rag_documents"
-# NOTE: Replace with your actual secrets setup if deploying
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "tgp_v1_ecSsk1__FlO2mB_gAaaP2i-Affa6Dv8OCVngkWzBJUY") 
-TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
+
+# --- Ollama/Local LLM Configuration ---
+OLLAMA_MODEL = "mistral" # Ensure you have pulled this model with 'ollama pull mistral'
+OLLAMA_URL = "http://localhost:11434" # Default Ollama URL
+LLM_TIMEOUT = 120 # Timeout for the LLM call
 
 # Dictionary of supported languages and their ISO 639-1 codes for the LLM
 LANGUAGE_DICT = {
@@ -58,21 +64,29 @@ LANGUAGE_DICT = {
 @st.cache_resource
 def initialize_dependencies():
     """
-    Initializes and returns the ChromaDB client and SentenceTransformer model.
+    Initializes and returns the ChromaDB client, SentenceTransformer model, and Ollama client.
     Using @st.cache_resource ensures this runs only once.
     """
     try:
-        # 1. Initialize ChromaDB (uses a temporary directory since we're not using Firestore)
+        # 1. Initialize ChromaDB
         db_path = tempfile.mkdtemp()
         db_client = chromadb.PersistentClient(path=db_path)
         
         # 2. Initialize Sentence Transformer
-        # Explicitly load the model to the CPU to avoid PyTorch-related errors
         model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
         
-        return db_client, model
+        # 3. Initialize Ollama Chat Model
+        # LangChain handles the connection to the running Ollama server
+        ollama_client = ChatOllama(
+            base_url=OLLAMA_URL,
+            model=OLLAMA_MODEL,
+            temperature=0.7,
+            request_timeout=LLM_TIMEOUT,
+        )
+        
+        return db_client, model, ollama_client
     except Exception as e:
-        st.error(f"An error occurred during dependency initialization. Check your 'requirements.txt' and environment variables. Error: {e}")
+        st.error(f"An error occurred during dependency initialization. Error: {e}")
         st.stop()
         
 def get_collection():
@@ -82,49 +96,36 @@ def get_collection():
     )
 
 @traceable(run_type="llm")
-def call_together_api(prompt, max_retries=5):
+def call_local_llm(prompt, max_retries=5):
     """
-    Calls the Together AI API with exponential backoff for retries.
+    Calls the local Ollama LLM via LangChain.
     The @traceable decorator creates an 'llm' run in LangSmith.
     """
-    retry_delay = 1
+    ollama_client = st.session_state.ollama_client
+    
+    system_message = SystemMessage(content="You are a helpful assistant. Be concise and accurate.")
+    user_message = HumanMessage(content=prompt)
+    
+    # Simple retry mechanism for local service/network issues
     for i in range(max_retries):
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {TOGETHER_API_KEY}"
-            }
-            messages_payload = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ]
-            payload = {
-                "model": "mistralai/Mistral-7B-Instruct-v0.2",
-                "messages": messages_payload,
-                "temperature": 0.7,
-                "max_tokens": 1024
-            }
+            with st.spinner(f"Contacting {OLLAMA_MODEL} on {OLLAMA_URL}... (Attempt {i+1}/{max_retries})"):
+                response = ollama_client.invoke([system_message, user_message])
+            return response.content
             
-            response = requests.post(TOGETHER_API_URL, headers=headers, data=json.dumps(payload))
-            response.raise_for_status()
-            
-            response_json = response.json()
-            return response_json['choices'][0]['message']['content']
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                st.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            elif e.response.status_code == 401:
-                st.error("Invalid API Key. Please check your Together AI API key.")
-                return f"Error: 401 Unauthorized"
-            else:
-                st.error(f"Failed to call API after {i+1} retries: {e}")
-                return f"Error: {e}"
+        except requests.exceptions.ConnectionError:
+            st.warning(f"Connection error to Ollama at {OLLAMA_URL}. Ensure Ollama is running and the model '{OLLAMA_MODEL}' is pulled. Retrying in 2 seconds...")
+            time.sleep(2)
+        except ValidationError as e:
+            st.error(f"Pydantic Validation Error (often means malformed response or connection issue): {e}")
+            return f"Error: Pydantic Validation Error during local LLM call."
         except Exception as e:
-            st.error(f"An error occurred during the API call: {e}")
-            return f"Error: {e}"
+            st.error(f"An unexpected error occurred during the local LLM call: {e}")
+            return f"Error: An unexpected error occurred: {e}"
+
+    st.error("Failed to connect to Ollama after multiple retries. Please check your Ollama server.")
+    return "Error: Failed to get response from local LLM."
+
 
 def clear_chroma_data():
     """Clears all data from the ChromaDB collection."""
@@ -193,6 +194,11 @@ def retrieve_documents(query, n_results=5):
         return results['documents'][0]
     return []
 
+def is_valid_github_raw_url(url):
+    """Simple check for a GitHub raw file URL for .txt or .md."""
+    pattern = re.compile(r"^https://raw\.githubusercontent\.com/.*?\.(txt|md)$", re.IGNORECASE)
+    return bool(pattern.match(url))
+
 @traceable(run_type="chain")
 def rag_pipeline(query, selected_language_code):
     """
@@ -208,7 +214,7 @@ def rag_pipeline(query, selected_language_code):
     relevant_docs = retrieve_documents(query)
     
     if not relevant_docs:
-        # Fallback if the retriever returns nothing (e.g., query is too specific/irrelevant)
+        # Fallback if the retriever returns nothing
         return "I couldn't find relevant information in the uploaded documents to answer your question."
 
     context = "\n".join(relevant_docs)
@@ -221,11 +227,10 @@ def rag_pipeline(query, selected_language_code):
         f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
     )
     
-    # Calls the decorated call_together_api function (creates a nested 'llm' run)
-    response = call_together_api(prompt)
+    # Calls the decorated call_local_llm function (creates a nested 'llm' run)
+    response = call_local_llm(prompt)
 
     if response.startswith("Error:"):
-        # The error handling inside call_together_api already provided a message.
         return response
     
     return response
@@ -248,11 +253,11 @@ def handle_user_input():
             
         # Run RAG and display assistant message
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
-                # The LangSmith trace starts here for the RAG pipeline
-                response = rag_pipeline(prompt, selected_language_code)
-                st.markdown(response)
+            # A separate spinner is inside call_local_llm for better feedback
+            selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
+            # The LangSmith trace starts here for the RAG pipeline
+            response = rag_pipeline(prompt, selected_language_code)
+            st.markdown(response)
 
         # Update chat history with assistant response
         st.session_state.messages.append({"role": "assistant", "content": response})
@@ -268,14 +273,14 @@ def handle_user_input():
 def main_ui():
     """Sets up the main Streamlit UI for the RAG chatbot."""
     st.set_page_config(
-        page_title="RAG Chat Flow", 
+        page_title="RAG Chat Flow (Ollama)", 
         layout="wide",
         initial_sidebar_state="auto"
     )
 
-    # Initialize dependencies outside of the main UI block to prevent re-initialization
-    if 'db_client' not in st.session_state or 'model' not in st.session_state:
-        st.session_state.db_client, st.session_state.model = initialize_dependencies()
+    # Initialize dependencies: db_client, model, and the new ollama_client
+    if 'db_client' not in st.session_state or 'model' not in st.session_state or 'ollama_client' not in st.session_state:
+        st.session_state.db_client, st.session_state.model, st.session_state.ollama_client = initialize_dependencies()
         
     if 'messages' not in st.session_state:
         st.session_state.messages = []
@@ -297,15 +302,19 @@ def main_ui():
     # Sidebar
     with st.sidebar:
         st.header("RAG Chat Flow")
+        st.markdown(f"Running LLM: **{OLLAMA_MODEL}** via Ollama at **{OLLAMA_URL}**")
+        st.warning("Ensure Ollama is running and the model is pulled!")
+
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
             options=list(LANGUAGE_DICT.keys()),
             key="language_selector"
         )
         
-        if st.button("New Chat", use_container_width=True):
+        if st.button("New Chat / Clear Documents", use_container_width=True):
             st.session_state.messages = []
-            clear_chroma_data()
+            clear_chroma_data() # Clear all documents on new chat
+            # Reset chat history logic for a clean start
             st.session_state.chat_history = {}
             st.session_state.current_chat_id = None
             st.experimental_rerun()
@@ -326,19 +335,21 @@ def main_ui():
                 is_current = chat_id == st.session_state.current_chat_id
                 style = "background-color: #262730; border-radius: 5px; padding: 10px;" if is_current else "padding: 10px;"
                 
-                st.markdown(
-                    f"<div style='{style}'>",
-                    unsafe_allow_html=True
-                )
-                if st.button(f"{chat_title}", key=f"btn_{chat_id}", use_container_width=True):
-                    st.session_state.current_chat_id = chat_id
-                    st.session_state.messages = st.session_state.chat_history[chat_id]['messages']
-                    st.experimental_rerun()
-                st.markdown(f"<small>{date_str}</small></div>", unsafe_allow_html=True)
+                # Using a container for better click area
+                with st.container():
+                    st.markdown(
+                        f"<div style='{style}'>",
+                        unsafe_allow_html=True
+                    )
+                    if st.button(f"{chat_title}", key=f"btn_{chat_id}", use_container_width=True):
+                        st.session_state.current_chat_id = chat_id
+                        st.session_state.messages = st.session_state.chat_history[chat_id]['messages']
+                        st.experimental_rerun()
+                    st.markdown(f"<small>{date_str}</small></div>", unsafe_allow_html=True)
 
     # Main content area
-    st.title("📚 Retrieval Augmented Generation (RAG) Chatbot")
-    st.info("Upload documents (TXT or PDF) to provide context for the chatbot, and all pipeline steps will be monitored in LangSmith.")
+    st.title("📚 Retrieval Augmented Generation (RAG) Chatbot - Local LLM")
+    st.info("Upload documents (TXT or PDF) to provide context. Powered by Ollama/Mistral and traceable in LangSmith.")
     
     # Document upload/processing section
     with st.container():
@@ -349,7 +360,7 @@ def main_ui():
             type=["txt", "pdf"], 
             accept_multiple_files=True
         )
-        github_url = st.text_input("Enter a GitHub raw `.txt` or `.md` URL:")
+        github_url = st.text_input("Enter a GitHub raw `.txt` or `.md` URL (e.g., https://raw.githubusercontent.com/user/repo/branch/file.txt):")
 
         if uploaded_files:
             if st.button(f"Process {len(uploaded_files)} File(s)"):
