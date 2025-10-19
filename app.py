@@ -37,9 +37,9 @@ from langsmith import traceable, tracing_context
 # --- Constants and Configuration ---
 COLLECTION_NAME = "rag_documents"
 
-# *** FIX FOR API ERROR: Switched to a model known to support the 'text-generation' task. ***
+# *** NEW FIX: Switched to Flan-T5-XXL, a model known for reliable 'text-generation' support. ***
 HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY") 
-HF_MODEL_ID = "HuggingFaceH4/zephyr-7b-beta" 
+HF_MODEL_ID = "google/flan-t5-xxl" 
 
 if not HUGGINGFACE_API_KEY:
     # Use Streamlit's secrets for a more secure deployment if the env var is missing
@@ -126,9 +126,9 @@ def call_huggingface_api(prompt, max_retries=5):
     """
     hf_client = st.session_state.hf_client
     
-    # HF Inference API uses the full prompt, including system/context
-    # Zephyr (and most instruct models) perform well with a clear instruction template
-    full_prompt = f"<|system|>You are a helpful expert document assistant that strictly uses the provided context to answer questions. Your response MUST be in the requested language.<|endoftext|>\n<|user|>{prompt}<|endoftext|>\n<|assistant|>"
+    # Use a simpler prompt for general text generation models like Flan-T5
+    # The full RAG instruction is in the prompt variable passed to this function.
+    full_prompt = prompt
     
     retry_delay = 1
     for i in range(max_retries):
@@ -138,8 +138,7 @@ def call_huggingface_api(prompt, max_retries=5):
                 prompt=full_prompt,
                 max_new_tokens=1024,
                 temperature=0.7,
-                # Explicitly define stop sequences to prevent the model from continuing the chat
-                stop_sequences=["<|endoftext|>", "<|user|>"], 
+                # No specific stop sequences needed for Flan-T5
             )
             
             # The text_generation function typically returns the generated string directly
@@ -250,8 +249,8 @@ def rag_pipeline(query, selected_language_code):
     
     # Ensure the prompt instructs the model to use the retrieved context and output the correct language
     prompt = (
-        f"Using ONLY the 'Context' provided below, answer the 'Question'. "
-        f"The final response MUST be in {st.session_state.selected_language}. "
+        f"You are an expert document assistant. Using ONLY the 'Context' provided below, "
+        f"answer the 'Question'. The final response MUST be in {st.session_state.selected_language}. "
         f"If the Context does not contain the answer, politely state that the information is missing. "
         f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
     )
