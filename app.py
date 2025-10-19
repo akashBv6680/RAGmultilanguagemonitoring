@@ -28,7 +28,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 # --- Hugging Face Imports ---
-# Import the client for the Inference API
 from huggingface_hub import InferenceClient
 
 # --- LangSmith Imports ---
@@ -37,15 +36,13 @@ from langsmith import traceable, tracing_context
 # --- Constants and Configuration ---
 COLLECTION_NAME = "rag_documents"
 
-# *** NEW FIX: Switched to Mistral-7B-Instruct-v0.1, a fast and highly available model. ***
+# *** CRITICAL FIX: Switched to the low-parameter, fast Gemma 2B Instruct model ***
 HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY") 
-HF_MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.1" 
+HF_MODEL_ID = "google/gemma-2b-it" 
 
 if not HUGGINGFACE_API_KEY:
-    # Use Streamlit's secrets for a more secure deployment if the env var is missing
-    # st.secrets is preferred in Streamlit Community Cloud
-    st.error("HUGGINGFACE_API_KEY environment variable is not set. Please set it or use st.secrets.")
-    # st.stop() # Uncomment this for production to prevent running without the key
+    st.error("HUGGINGFACE_API_KEY environment variable is not set. Please set it in your Streamlit secrets or environment.")
+    # st.stop() 
 
 # Dictionary of supported languages and their ISO 639-1 codes for the LLM
 LANGUAGE_DICT = {
@@ -68,22 +65,17 @@ LANGUAGE_DICT = {
 }
 
 # =====================================================================
-# FIX 2: SESSION STATE INITIALIZATION
-# This block ensures 'selected_language' exists before the rest of the 
-# app code, preventing the previous KeyError.
+# SESSION STATE INITIALIZATION
 # =====================================================================
 if 'selected_language' not in st.session_state:
-    # Set the default language to 'English', which must be a key in LANGUAGE_DICT
     st.session_state['selected_language'] = 'English'
     
-# Initialize other core session state variables
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = {}
 if 'current_chat_id' not in st.session_state:
     st.session_state.current_chat_id = None
-# =====================================================================
 
 
 @st.cache_resource
@@ -101,7 +93,7 @@ def initialize_dependencies():
         model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
         
         # 3. Initialize Hugging Face Inference Client (for LLM)
-        # The token is passed directly for authentication
+        # Note: Gemma models on Hugging Face require accepting a license on the Hub page
         hf_client = InferenceClient(
             model=HF_MODEL_ID, 
             token=HUGGINGFACE_API_KEY
@@ -122,12 +114,13 @@ def get_collection():
 def call_huggingface_api(prompt, max_retries=5):
     """
     Calls the Hugging Face Inference API for text generation.
-    The @traceable decorator creates an 'llm' run in LangSmith.
+    Uses a simple retry mechanism for common loading/rate limit errors.
     """
     hf_client = st.session_state.hf_client
     
-    # Use the Mistral Instruct template for the new model
-    full_prompt = f"<s>[INST] {prompt} [/INST]"
+    # Use the Gemma Instruct template for best performance:
+    # <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
+    full_prompt = f"<bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
     
     retry_delay = 1
     for i in range(max_retries):
@@ -137,26 +130,30 @@ def call_huggingface_api(prompt, max_retries=5):
                 prompt=full_prompt,
                 max_new_tokens=1024,
                 temperature=0.7,
+                # Setting this can help avoid a specific class of errors 
+                # for certain gated models, even if Gemma is open.
+                do_sample=True,
             )
             
-            # The text_generation function typically returns the generated string directly
             return response.strip()
             
         except requests.exceptions.HTTPError as e:
-            # Hugging Face returns a 429 for rate limit or a 503 while the model loads
-            if e.response.status_code == 429 or e.response.status_code == 503:
-                st.warning(f"Model is loading or rate limit exceeded. Retrying in {retry_delay} seconds...")
+            # Handle common Hugging Face Inference API errors
+            status_code = e.response.status_code
+            if status_code in [429, 503]:
+                st.warning(f"Model is loading or rate limit exceeded (Code: {status_code}). Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
                 retry_delay *= 2
-            elif e.response.status_code == 401:
+            elif status_code == 401:
                 st.error("Invalid Hugging Face API Key. Please check your HUGGINGFACE_API_KEY.")
                 return f"Error: 401 Unauthorized"
+            elif status_code == 400:
+                 st.error(f"400 Bad Request. Ensure you have accepted the license for the model '{HF_MODEL_ID}' on the Hugging Face Hub.")
+                 return f"Error: 400 Bad Request / License not accepted"
             else:
-                # Capture and return the specific HTTP error
-                st.error(f"Failed to call API after {i+1} retries. Status: {e.response.status_code}. Error: {e}")
+                st.error(f"Failed to call API after {i+1} retries. Status: {status_code}. Error: {e}")
                 return f"Error: {e}"
         except Exception as e:
-            # Capture and return the generic error
             st.error(f"An unexpected error occurred during the API call: {e}")
             return f"Error: {e}"
 
@@ -211,7 +208,6 @@ def process_and_store_documents(documents):
 def retrieve_documents(query, n_results=5):
     """
     Retrieves the most relevant documents from ChromaDB based on a query.
-    The @traceable decorator creates a 'retriever' run in LangSmith.
     """
     collection = get_collection()
     model = st.session_state.model
@@ -231,8 +227,6 @@ def retrieve_documents(query, n_results=5):
 def rag_pipeline(query, selected_language_code):
     """
     Executes the full RAG pipeline with a check for documents.
-    The @traceable decorator creates a 'chain' run in LangSmith, which
-    will nest the 'retriever' and 'llm' calls.
     """
     collection = get_collection()
     if collection.count() == 0:
@@ -247,19 +241,18 @@ def rag_pipeline(query, selected_language_code):
 
     context = "\n".join(relevant_docs)
     
-    # Ensure the prompt instructs the model to use the retrieved context and output the correct language
+    # Prompt engineering for a small model to focus ONLY on context and output the correct language
     prompt = (
-        f"You are an expert document assistant. Using ONLY the 'Context' provided below, "
-        f"answer the 'Question'. The final response MUST be in {st.session_state.selected_language}. "
-        f"If the Context does not contain the answer, politely state that the information is missing. "
+        f"You are an expert document assistant. Your task is to answer the 'Question' using ONLY the 'Context' provided below. "
+        f"Your final response MUST be in {st.session_state.selected_language}. "
+        f"If the Context does not contain the answer, you must politely state that the information is missing. "
         f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
     )
     
-    # Calls the decorated call_huggingface_api function (creates a nested 'llm' run)
+    # Calls the decorated call_huggingface_api function 
     response = call_huggingface_api(prompt)
 
     if response.startswith("Error:"):
-        # The error handling inside call_huggingface_api already provided a message.
         return response
     
     return response
@@ -287,9 +280,7 @@ def handle_user_input():
         # Run RAG and display assistant message
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                # The st.session_state.selected_language is now guaranteed to exist
                 selected_language_code = LANGUAGE_DICT[st.session_state.selected_language] 
-                # The LangSmith trace starts here for the RAG pipeline
                 response = rag_pipeline(prompt, selected_language_code)
                 st.markdown(response)
 
@@ -316,8 +307,6 @@ def main_ui():
     if 'db_client' not in st.session_state or 'model' not in st.session_state or 'hf_client' not in st.session_state:
         st.session_state.db_client, st.session_state.model, st.session_state.hf_client = initialize_dependencies()
         
-    # Initialization for messages and history is already done outside this function
-    
     if 'current_chat_id' not in st.session_state or not st.session_state.messages:
         # Start a new chat session if none exists or if the current one is empty
         new_chat_id = str(uuid.uuid4())
@@ -336,7 +325,6 @@ def main_ui():
         # Display the current LLM
         st.caption(f"LLM: **{HF_MODEL_ID}**")
         
-        # The selectbox sets the 'selected_language' key.
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
             options=list(LANGUAGE_DICT.keys()),
