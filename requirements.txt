@@ -1,34 +1,9 @@
-# --- Core Streamlit and Utilities ---
-streamlit==1.36.0
-requests==2.32.3
-numpy==1.26.4
-uuid
-json
-time
-re
-shutil
-
-# --- RAG Core ---
-chromadb==0.5.4
-sentence-transformers==2.7.0
-pypdf==4.2.0
-
-# --- Text Splitting & Dependency Fix ---
-langchain-text-splitters==0.2.2
-pysqlite3-binary
-
-# --- Hugging Face for LLM Inference ---
-huggingface-hub==0.23.3  # The primary library for the Inference Client
-# We no longer need 'torch' or 'transformers' if using the Inference API, 
-# as the model inference runs on Hugging Face's servers, but I'll keep them 
-# commented out in case you need them later for local model usage.
-# torch
-# transformers
-
-# --- Observability ---
+streamlit
+pysqlite3-binary 
+chromadb
+sentence-transformers
+langchain-text-splitters
+pypdf
+huggingface-hub
 langsmith
-# The 'langchain' package is not strictly needed since we use base components, 
-# but it's often part of the ecosystem, so I'll keep it for compatibility.
-langchain
-# gitpython is not used in the provided code, removing for cleanliness.
-# gitpython
+requests
