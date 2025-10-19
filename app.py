@@ -26,7 +26,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 # --- Local LLM & LangChain Imports ---
-from langchain.chat_models import ChatOllama
+# <--- FIX APPLIED HERE: Changed import from langchain.chat_models to langchain_ollama
+from langchain_ollama import ChatOllama 
 from langchain.schema import HumanMessage, SystemMessage
 from pydantic import ValidationError # Added for better error handling with LangChain
 
