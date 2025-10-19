@@ -11,12 +11,11 @@ import re
 import shutil
 
 # --- Dependency Check and Fix for pysqlite3 ---
+# This block MUST be at the very top to fix the sqlite3 version issue for ChromaDB
 try:
-    # This block MUST be at the very top to fix the sqlite3 version issue for ChromaDB
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules['pysqlite3']
 except ImportError:
-    # If the environment is set up correctly, the normal sqlite3 module will be used.
     pass
 
 # --- Core RAG Imports ---
@@ -26,10 +25,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 # --- Local LLM & LangChain Imports ---
-# <--- FIX APPLIED HERE: Changed import from langchain.chat_models to langchain_ollama
+# FIX: Changed import location for ChatOllama
 from langchain_ollama import ChatOllama 
 from langchain.schema import HumanMessage, SystemMessage
-from pydantic import ValidationError # Added for better error handling with LangChain
+from pydantic import ValidationError
 
 # --- LangSmith Imports ---
 from langsmith import Client, traceable, tracing_context
@@ -39,7 +38,11 @@ COLLECTION_NAME = "rag_documents"
 
 # --- Ollama/Local LLM Configuration ---
 OLLAMA_MODEL = "mistral" # Ensure you have pulled this model with 'ollama pull mistral'
-OLLAMA_URL = "http://localhost:11434" # Default Ollama URL
+# IMPORTANT FIX NOTE: 
+# The 'Cannot assign requested address' error is because this address 
+# is inaccessible from Streamlit Cloud. If you deploy to the cloud, 
+# you MUST change this to the public IP/hostname of your running Ollama server.
+OLLAMA_URL = "http://localhost:11434" 
 LLM_TIMEOUT = 120 # Timeout for the LLM call
 
 # Dictionary of supported languages and their ISO 639-1 codes for the LLM
@@ -74,10 +77,10 @@ def initialize_dependencies():
         db_client = chromadb.PersistentClient(path=db_path)
         
         # 2. Initialize Sentence Transformer
-        model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
+        # Ensure the device is 'cpu' for Streamlit Cloud compatibility unless you configure GPUs
+        model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu') 
         
         # 3. Initialize Ollama Chat Model
-        # LangChain handles the connection to the running Ollama server
         ollama_client = ChatOllama(
             base_url=OLLAMA_URL,
             model=OLLAMA_MODEL,
@@ -87,7 +90,7 @@ def initialize_dependencies():
         
         return db_client, model, ollama_client
     except Exception as e:
-        st.error(f"An error occurred during dependency initialization. Error: {e}")
+        st.error(f"An error occurred during dependency initialization. Please check your **Ollama server (must be accessible)**, **OLLAMA_MODEL** name, and **OLLAMA_URL**. Error: {e}")
         st.stop()
         
 def get_collection():
@@ -114,8 +117,13 @@ def call_local_llm(prompt, max_retries=5):
                 response = ollama_client.invoke([system_message, user_message])
             return response.content
             
-        except requests.exceptions.ConnectionError:
-            st.warning(f"Connection error to Ollama at {OLLAMA_URL}. Ensure Ollama is running and the model '{OLLAMA_MODEL}' is pulled. Retrying in 2 seconds...")
+        except requests.exceptions.ConnectionError as e:
+            # Catch the specific connection error for better user feedback
+            st.warning(f"Connection error to Ollama at {OLLAMA_URL}. Ensure Ollama is running, the model '{OLLAMA_MODEL}' is pulled, and the URL is accessible from this environment. Retrying in 2 seconds...")
+            # Added for debugging the specific Errno 99
+            if "Cannot assign requested address" in str(e):
+                 st.error("Connection failed: [Errno 99] Cannot assign requested address. If you're on Streamlit Cloud, you must change 'localhost' to a public IP/hostname where Ollama is hosted.")
+                 break # Do not retry on a configuration error
             time.sleep(2)
         except ValidationError as e:
             st.error(f"Pydantic Validation Error (often means malformed response or connection issue): {e}")
@@ -124,7 +132,7 @@ def call_local_llm(prompt, max_retries=5):
             st.error(f"An unexpected error occurred during the local LLM call: {e}")
             return f"Error: An unexpected error occurred: {e}"
 
-    st.error("Failed to connect to Ollama after multiple retries. Please check your Ollama server.")
+    st.error("Failed to connect to Ollama after multiple retries. Please check your Ollama server configuration.")
     return "Error: Failed to get response from local LLM."
 
 
@@ -254,7 +262,6 @@ def handle_user_input():
             
         # Run RAG and display assistant message
         with st.chat_message("assistant"):
-            # A separate spinner is inside call_local_llm for better feedback
             selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
             # The LangSmith trace starts here for the RAG pipeline
             response = rag_pipeline(prompt, selected_language_code)
@@ -289,8 +296,8 @@ def main_ui():
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = {}
     
+    # Only start a new chat if one isn't currently active (e.g., after initial load or "New Chat" button click)
     if 'current_chat_id' not in st.session_state or not st.session_state.messages:
-        # Start a new chat session if none exists or if the current one is empty
         new_chat_id = str(uuid.uuid4())
         st.session_state.current_chat_id = new_chat_id
         st.session_state.messages = []
@@ -303,8 +310,9 @@ def main_ui():
     # Sidebar
     with st.sidebar:
         st.header("RAG Chat Flow")
+        # IMPORTANT NOTE on OLLAMA_URL
         st.markdown(f"Running LLM: **{OLLAMA_MODEL}** via Ollama at **{OLLAMA_URL}**")
-        st.warning("Ensure Ollama is running and the model is pulled!")
+        st.warning("⚠️ If you are deploying to Streamlit Cloud, the URL above **MUST be changed** to a publicly accessible IP/hostname for your Ollama server.")
 
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
@@ -332,16 +340,16 @@ def main_ui():
                 chat_title = st.session_state.chat_history[chat_id]['title']
                 date_str = st.session_state.chat_history[chat_id]['date'].strftime("%b %d, %I:%M %p")
                 
-                # Highlight the current chat
                 is_current = chat_id == st.session_state.current_chat_id
+                # Conditional styling for the current chat
                 style = "background-color: #262730; border-radius: 5px; padding: 10px;" if is_current else "padding: 10px;"
                 
-                # Using a container for better click area
                 with st.container():
                     st.markdown(
                         f"<div style='{style}'>",
                         unsafe_allow_html=True
                     )
+                    # Use a unique key for each button and set the current chat on click
                     if st.button(f"{chat_title}", key=f"btn_{chat_id}", use_container_width=True):
                         st.session_state.current_chat_id = chat_id
                         st.session_state.messages = st.session_state.chat_history[chat_id]['messages']
@@ -375,7 +383,6 @@ def main_ui():
                             if file_ext == "txt":
                                 file_contents = uploaded_file.read().decode("utf-8")
                             elif file_ext == "pdf":
-                                # New PDF handling logic
                                 file_contents = extract_text_from_pdf(uploaded_file)
                             else:
                                 st.warning(f"Skipping unsupported file type: {uploaded_file.name}")
