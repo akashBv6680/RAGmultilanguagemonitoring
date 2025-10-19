@@ -1,10 +1,10 @@
-streamlit==1.36.0
-sentence-transformers==2.7.0
-chromadb==0.5.4
-requests==2.32.3
-langchain-text-splitters==0.2.2
-gitpython==3.1.43
-numpy==1.26.4
+streamlit
+sentence-transformers
+chromadb
+requests
+langchain-text-splitters
+gitpython
+numpy
 torch
 transformers
 pysqlite3-binary
@@ -13,3 +13,4 @@ langsmith
 pypdf
 pydantic
 langchain-ollama
+langchain-community
