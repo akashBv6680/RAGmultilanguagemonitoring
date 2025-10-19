@@ -1,3 +1,4 @@
+# requirements.txt
 streamlit
 sentence-transformers
 chromadb
@@ -14,3 +15,4 @@ pypdf
 pydantic
 langchain-ollama
 langchain-community
+langchain-core 
