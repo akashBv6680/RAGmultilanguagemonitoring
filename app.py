@@ -10,9 +10,12 @@ from datetime import datetime
 import re
 import shutil
 
-# --- Dependency Check and Fix for pysqlite3 ---
+# =====================================================================
+# FIX 1: SQLITE3 PATCH
+# This block MUST be at the very top to fix the sqlite3 version issue 
+# for libraries like ChromaDB on Streamlit Community Cloud.
+# =====================================================================
 try:
-    # This block MUST be at the very top to fix the sqlite3 version issue for ChromaDB
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules['pysqlite3']
 except ImportError:
@@ -65,6 +68,26 @@ LANGUAGE_DICT = {
     "Dutch": "nl",
     "Turkish": "tr"
 }
+
+# =====================================================================
+# FIX 2: SESSION STATE INITIALIZATION
+# This block ensures 'selected_language' exists before the rest of the 
+# app code, including any function that relies on it (like handle_user_input),
+# is executed. This resolves the KeyError.
+# =====================================================================
+if 'selected_language' not in st.session_state:
+    # Set the default language to 'English', which must be a key in LANGUAGE_DICT
+    st.session_state['selected_language'] = 'English'
+    
+# Initialize other core session state variables if they are used elsewhere before main_ui
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = {}
+if 'current_chat_id' not in st.session_state:
+    st.session_state.current_chat_id = None
+# =====================================================================
+
 
 @st.cache_resource
 def initialize_dependencies():
@@ -266,7 +289,8 @@ def handle_user_input():
         # Run RAG and display assistant message
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                selected_language_code = LANGUAGE_DICT[st.session_state.selected_language]
+                # The st.session_state.selected_language is now guaranteed to exist
+                selected_language_code = LANGUAGE_DICT[st.session_state.selected_language] 
                 # The LangSmith trace starts here for the RAG pipeline
                 response = rag_pipeline(prompt, selected_language_code)
                 st.markdown(response)
@@ -294,11 +318,7 @@ def main_ui():
     if 'db_client' not in st.session_state or 'model' not in st.session_state or 'hf_client' not in st.session_state:
         st.session_state.db_client, st.session_state.model, st.session_state.hf_client = initialize_dependencies()
         
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = {}
+    # Initialization for messages and history is already done outside this function
     
     if 'current_chat_id' not in st.session_state or not st.session_state.messages:
         # Start a new chat session if none exists or if the current one is empty
@@ -318,6 +338,8 @@ def main_ui():
         # Display the current LLM
         st.caption(f"LLM: **{HF_MODEL_ID}**")
         
+        # The selectbox sets the 'selected_language' key.
+        # Since it's initialized, it will now safely hold a value from this list.
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
             options=list(LANGUAGE_DICT.keys()),
