@@ -37,9 +37,9 @@ from langsmith import traceable, tracing_context
 # --- Constants and Configuration ---
 COLLECTION_NAME = "rag_documents"
 
-# *** NEW FIX: Switched to Flan-T5-XXL, a model known for reliable 'text-generation' support. ***
+# *** NEW FIX: Switched to Mistral-7B-Instruct-v0.1, a fast and highly available model. ***
 HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY") 
-HF_MODEL_ID = "google/flan-t5-xxl" 
+HF_MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.1" 
 
 if not HUGGINGFACE_API_KEY:
     # Use Streamlit's secrets for a more secure deployment if the env var is missing
@@ -126,9 +126,8 @@ def call_huggingface_api(prompt, max_retries=5):
     """
     hf_client = st.session_state.hf_client
     
-    # Use a simpler prompt for general text generation models like Flan-T5
-    # The full RAG instruction is in the prompt variable passed to this function.
-    full_prompt = prompt
+    # Use the Mistral Instruct template for the new model
+    full_prompt = f"<s>[INST] {prompt} [/INST]"
     
     retry_delay = 1
     for i in range(max_retries):
@@ -138,7 +137,6 @@ def call_huggingface_api(prompt, max_retries=5):
                 prompt=full_prompt,
                 max_new_tokens=1024,
                 temperature=0.7,
-                # No specific stop sequences needed for Flan-T5
             )
             
             # The text_generation function typically returns the generated string directly
@@ -154,9 +152,11 @@ def call_huggingface_api(prompt, max_retries=5):
                 st.error("Invalid Hugging Face API Key. Please check your HUGGINGFACE_API_KEY.")
                 return f"Error: 401 Unauthorized"
             else:
-                st.error(f"Failed to call API after {i+1} retries: {e}")
+                # Capture and return the specific HTTP error
+                st.error(f"Failed to call API after {i+1} retries. Status: {e.response.status_code}. Error: {e}")
                 return f"Error: {e}"
         except Exception as e:
+            # Capture and return the generic error
             st.error(f"An unexpected error occurred during the API call: {e}")
             return f"Error: {e}"
 
