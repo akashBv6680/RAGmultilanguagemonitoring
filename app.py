@@ -37,11 +37,9 @@ from langsmith import traceable, tracing_context
 # --- Constants and Configuration ---
 COLLECTION_NAME = "rag_documents"
 
-# *** IMPORTANT CHANGE: Using Hugging Face Access Token ***
-# The Access Token is securely read from the environment variable HUGGINGFACE_API_KEY
+# *** FIX FOR API ERROR: Switched to a model known to support the 'text-generation' task. ***
 HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY") 
-# Recommended model on the Hugging Face Inference API
-HF_MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+HF_MODEL_ID = "HuggingFaceH4/zephyr-7b-beta" 
 
 if not HUGGINGFACE_API_KEY:
     # Use Streamlit's secrets for a more secure deployment if the env var is missing
@@ -72,14 +70,13 @@ LANGUAGE_DICT = {
 # =====================================================================
 # FIX 2: SESSION STATE INITIALIZATION
 # This block ensures 'selected_language' exists before the rest of the 
-# app code, including any function that relies on it (like handle_user_input),
-# is executed. This resolves the KeyError.
+# app code, preventing the previous KeyError.
 # =====================================================================
 if 'selected_language' not in st.session_state:
     # Set the default language to 'English', which must be a key in LANGUAGE_DICT
     st.session_state['selected_language'] = 'English'
     
-# Initialize other core session state variables if they are used elsewhere before main_ui
+# Initialize other core session state variables
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 if 'chat_history' not in st.session_state:
@@ -130,7 +127,8 @@ def call_huggingface_api(prompt, max_retries=5):
     hf_client = st.session_state.hf_client
     
     # HF Inference API uses the full prompt, including system/context
-    full_prompt = f"System: You are a helpful assistant.\n\nUser: {prompt}\n\nAssistant:"
+    # Zephyr (and most instruct models) perform well with a clear instruction template
+    full_prompt = f"<|system|>You are a helpful expert document assistant that strictly uses the provided context to answer questions. Your response MUST be in the requested language.<|endoftext|>\n<|user|>{prompt}<|endoftext|>\n<|assistant|>"
     
     retry_delay = 1
     for i in range(max_retries):
@@ -140,7 +138,8 @@ def call_huggingface_api(prompt, max_retries=5):
                 prompt=full_prompt,
                 max_new_tokens=1024,
                 temperature=0.7,
-                # Stop sequences can be added here if needed, e.g., stop_sequences=["\nUser:"]
+                # Explicitly define stop sequences to prevent the model from continuing the chat
+                stop_sequences=["<|endoftext|>", "<|user|>"], 
             )
             
             # The text_generation function typically returns the generated string directly
@@ -251,8 +250,8 @@ def rag_pipeline(query, selected_language_code):
     
     # Ensure the prompt instructs the model to use the retrieved context and output the correct language
     prompt = (
-        f"You are an expert document assistant. Using ONLY the 'Context' provided below, "
-        f"answer the 'Question'. The final response MUST be in {st.session_state.selected_language}. "
+        f"Using ONLY the 'Context' provided below, answer the 'Question'. "
+        f"The final response MUST be in {st.session_state.selected_language}. "
         f"If the Context does not contain the answer, politely state that the information is missing. "
         f"\n\nContext: {context}\n\nQuestion: {query}\n\nAnswer:"
     )
@@ -339,7 +338,6 @@ def main_ui():
         st.caption(f"LLM: **{HF_MODEL_ID}**")
         
         # The selectbox sets the 'selected_language' key.
-        # Since it's initialized, it will now safely hold a value from this list.
         st.session_state.selected_language = st.selectbox(
             "Select Response Language",
             options=list(LANGUAGE_DICT.keys()),
