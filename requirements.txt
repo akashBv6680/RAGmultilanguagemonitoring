@@ -21,11 +21,4 @@ sentence-transformers
 # Document Loaders/Parsers
 pypdf # For PDF processing
 requests # For fetching GitHub URLs
-streamlit
-google-genai
-langchain-google-genai
-langchain-community
-langchain
-chroma-core
-pypdf
-firebase-admin
+
